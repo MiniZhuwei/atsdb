@@ -1,19 +1,24 @@
 use crate::storage::chunk::MutableChunk;
 use hashbrown::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 struct Table {
+    name: Arc<str>,
     mutable: Vec<MutableChunk>,
 }
 
 struct DB {
-    tables: HashMap<Arc<str>, Table>,
+    name: Arc<str>,
+    tables: Arc<RwLock<HashMap<Arc<str>, Table>>>,
 }
 
 impl DB {
-    fn new() -> Self {
+    fn new(name: &str) -> Self {
         return Self {
-            tables: HashMap::new(),
+            name: Arc::from(name),
+            tables: Arc::new(RwLock::new(HashMap::new())),
         };
     }
+
+    fn create_table(&mut self) {}
 }

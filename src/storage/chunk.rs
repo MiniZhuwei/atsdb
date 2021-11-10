@@ -16,6 +16,7 @@ use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::scalar::ScalarValue;
 use hashbrown::{HashMap, HashSet};
+use regex::Regex;
 use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -32,29 +33,35 @@ impl<'a> Row<'a> {
         return Self { id, chunk };
     }
 
-    fn insert(&mut self, timestamp: Instant, scalars: HashMap<&str, Scalar>) {
+    fn insert(&self, timestamp: Instant, scalars: HashMap<&str, Scalar>) {
         let mut columns = self.chunk.columns.write().unwrap();
         for (name, column) in columns.scalars.iter_mut() {
-            let series = column.get_mut(self.id).unwrap();
+            let series = column.get(self.id).unwrap();
             let scalar = scalars.get(name.as_ref()).cloned();
             let index = (timestamp - self.chunk.info.start_at)
                 .div_duration_f64(self.chunk.info.time_interval) as u32;
             match series {
-                ScalarType::Int(series) => series.insert(index, scalar.map(|s| s.into())),
-                ScalarType::Float(series) => series.insert(index, scalar.map(|s| s.into())),
+                ScalarType::Int(series) => series
+                    .write()
+                    .unwrap()
+                    .insert(index, scalar.map(|s| s.into())),
+                ScalarType::Float(series) => series
+                    .write()
+                    .unwrap()
+                    .insert(index, scalar.map(|s| s.into())),
             }
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Series<G> {
     data: Vec<Option<G>>,
 }
 
 impl<G: 'static + Default + Clone + Copy> Series<G> {
     fn new(len: u32) -> Self {
-        return Series {
+        return Self {
             data: vec![None; len as usize],
         };
     }
@@ -96,10 +103,12 @@ impl From<Scalar> for i64 {
     }
 }
 
+type LockedSeries<G> = RwLock<Series<G>>;
+
 #[derive(Debug)]
 struct ScalarColumn {
     series_len: u32,
-    data: ScalarType<Vec<Series<i64>>, Vec<Series<f64>>>,
+    data: ScalarType<Vec<LockedSeries<i64>>, Vec<LockedSeries<f64>>>,
 }
 
 impl ScalarColumn {
@@ -118,26 +127,23 @@ impl ScalarColumn {
 
     fn resize(&mut self, to: u32) {
         match &mut self.data {
-            ScalarType::Int(column) => column.resize(to as usize, Series::new(self.series_len)),
-            ScalarType::Float(column) => column.resize(to as usize, Series::new(self.series_len)),
+            ScalarType::Int(column) => {
+                column.resize_with(to as usize, || RwLock::new(Series::new(self.series_len)))
+            }
+            ScalarType::Float(column) => {
+                column.resize_with(to as usize, || RwLock::new(Series::new(self.series_len)))
+            }
         };
     }
 
     fn push_zero(&mut self) {
         match &mut self.data {
-            ScalarType::Int(column) => column.push(Series::new(self.series_len)),
-            ScalarType::Float(column) => column.push(Series::new(self.series_len)),
+            ScalarType::Int(column) => column.push(RwLock::new(Series::new(self.series_len))),
+            ScalarType::Float(column) => column.push(RwLock::new(Series::new(self.series_len))),
         };
     }
 
-    fn get_mut(&mut self, offset: usize) -> Option<ScalarType<&mut Series<i64>, &mut Series<f64>>> {
-        return match &mut self.data {
-            ScalarType::Int(data) => data.get_mut(offset).map(ScalarType::Int),
-            ScalarType::Float(data) => data.get_mut(offset).map(ScalarType::Float),
-        };
-    }
-
-    fn get(&self, offset: usize) -> Option<ScalarType<&Series<i64>, &Series<f64>>> {
+    fn get(&self, offset: usize) -> Option<ScalarType<&LockedSeries<i64>, &LockedSeries<f64>>> {
         return match &self.data {
             ScalarType::Int(data) => data.get(offset).map(ScalarType::Int),
             ScalarType::Float(data) => data.get(offset).map(ScalarType::Float),
@@ -195,22 +201,41 @@ impl<'a> Filter<'a> {
         let iter = filter_id
             .into_iter()
             .map(|id| *column.data.get(id).unwrap());
-        return match self.matcher {
+
+        let match_func: Box<dyn Fn(&(usize, usize)) -> bool> = match self.matcher {
             Matcher::LiteralEqual(v) => {
                 let sid = match v {
                     Some(s) => column.values.lookup(s)?,
                     None => 0,
                 };
-                Some(
-                    iter.into_iter()
-                        .enumerate()
-                        .filter(|(_, record)| *record == sid)
-                        .map(|(id, _)| id)
-                        .collect(),
-                )
+                Box::new(move |(_, record): &(usize, usize)| *record == sid)
             }
-            _ => todo!(),
+            Matcher::LiteralNotEqual(v) => {
+                let sid = match v {
+                    Some(s) => column.values.lookup(s)?,
+                    None => 0,
+                };
+                Box::new(move |(_, record): &(usize, usize)| *record != sid)
+            }
+            Matcher::RegexMatch(v) => {
+                let regex = Regex::new(v).ok()?;
+                Box::new(move |(_, record): &(usize, usize)| {
+                    regex.is_match(column.values.get(*record).unwrap())
+                })
+            }
+            Matcher::RegexNotMatch(v) => {
+                let regex = Regex::new(v).ok()?;
+                Box::new(move |(_, record): &(usize, usize)| {
+                    !regex.is_match(column.values.get(*record).unwrap())
+                })
+            }
         };
+        return Some(
+            iter.enumerate()
+                .filter(match_func)
+                .map(|(id, _)| id)
+                .collect(),
+        );
     }
 }
 
@@ -226,24 +251,21 @@ impl Columns {
         return Default::default();
     }
 
-    fn filter_labels(
-        &self,
-        labels: Vec<Filter>,
-        pre_filtered: Option<HashSet<usize>>,
-    ) -> HashSet<usize> {
-        let mut res = pre_filtered;
-        for filter in &labels {
-            if let Some(records) = self.labels.get(filter.name).and_then(|column| {
-                filter.filter(column, res.as_ref().map(|v| v.iter().cloned().collect()))
-            }) {
-                let set = records.iter().cloned().collect::<HashSet<_>>();
-                res = match res {
-                    None => Some(set),
-                    Some(inter) => Some(inter.intersection(&set).cloned().collect()),
-                };
-            }
+    fn filter_label(&self, filter: Filter, pre_filtered: Option<HashSet<usize>>) -> HashSet<usize> {
+        let mut pre_filtered = pre_filtered;
+        if let Some(records) = self.labels.get(filter.name).and_then(|column| {
+            filter.filter(
+                column,
+                pre_filtered.as_ref().map(|v| v.iter().cloned().collect()),
+            )
+        }) {
+            let set = records.iter().cloned().collect::<HashSet<_>>();
+            pre_filtered = match pre_filtered {
+                None => Some(set),
+                Some(inter) => Some(inter.intersection(&set).cloned().collect()),
+            };
         }
-        return res.unwrap_or_default();
+        return pre_filtered.unwrap_or_default();
     }
 }
 
@@ -310,30 +332,30 @@ impl<'a> MutableChunk {
         return Row::new(self, self.stat.add_record_num(1));
     }
 
-    fn filter(
-        &'a self,
-        labels: Vec<Filter>,
-        pre_filtered: Option<HashSet<usize>>,
-    ) -> HashSet<usize> {
+    fn filter(&self, filter: Filter, pre_filtered: Option<HashSet<usize>>) -> HashSet<usize> {
         let columns = self.on_read();
-        return columns.filter_labels(labels, pre_filtered);
+        return columns.filter_label(filter, pre_filtered);
     }
 
-    fn lookup_or_insert(
-        &'a self,
-        lock: RwLockWriteGuard<'a, Columns>,
-        labels: HashMap<&str, &str>,
-    ) -> Row<'a> {
-        let mut filters = Vec::new();
-
+    fn lookup_or_insert(&'a self, labels: HashMap<&str, &str>) -> Row<'a> {
+        let mut pre_filtered = None;
+        let lock = self.columns.write().unwrap();
         for column_name in lock.labels.keys() {
-            filters.push(Filter {
-                name: column_name,
-                matcher: Matcher::LiteralEqual(labels.get(column_name.as_ref()).cloned()),
-            });
+            pre_filtered = Some(lock.filter_label(
+                Filter {
+                    name: column_name,
+                    matcher: Matcher::LiteralEqual(labels.get(column_name.as_ref()).cloned()),
+                },
+                pre_filtered,
+            ));
         }
-        return match lock.filter_labels(filters, None).iter().cloned().next() {
-            Some(record_id) => Row::new(self, record_id),
+        return match pre_filtered {
+            Some(set) => set
+                .iter()
+                .cloned()
+                .next()
+                .map(|id| Row::new(self, id))
+                .unwrap_or_else(|| self.create_record(lock, labels)),
             None => self.create_record(lock, labels),
         };
     }
@@ -379,7 +401,7 @@ impl<'a> MutableChunk {
                                 let mut builder = ListBuilder::new(Int64Builder::new(
                                     self.info.series_len as usize,
                                 ));
-                                for scalar in series.iter() {
+                                for scalar in series.read().unwrap().iter() {
                                     builder.values().append_option(scalar).unwrap();
                                 }
                                 builder.append(true).unwrap();
@@ -389,7 +411,7 @@ impl<'a> MutableChunk {
                                 let mut builder = ListBuilder::new(Float64Builder::new(
                                     self.info.series_len as usize,
                                 ));
-                                for scalar in series.iter() {
+                                for scalar in series.read().unwrap().iter() {
                                     builder.values().append_option(scalar).unwrap();
                                 }
                                 builder.append(true).unwrap();
@@ -434,7 +456,10 @@ impl<'a> MutableChunk {
                     let right = self.datafusion_scan(*right, None)?;
                     Ok(left.union(&right).cloned().collect())
                 }
-                ArrowOperator::Eq => {
+                ArrowOperator::Eq
+                | ArrowOperator::NotEq
+                | ArrowOperator::Like
+                | ArrowOperator::NotLike => {
                     let columns = self.on_read();
                     if let box Expr::Column(column) = left {
                         let column_name = column.name.as_str();
@@ -442,22 +467,32 @@ impl<'a> MutableChunk {
                             return Err(QueryError::NoSuchScalar { name: column.name });
                         }
                         match right {
-                            box Expr::Literal(ScalarValue::Utf8(value)) => Ok(self.filter(
-                                vec![Filter {
-                                    name: column_name,
-                                    matcher: Matcher::LiteralEqual(value.as_deref()),
-                                }],
-                                pre_filtered,
-                            )),
+                            box Expr::Literal(ScalarValue::Utf8(value)) => {
+                                let filterer = match op {
+                                    ArrowOperator::Eq => Matcher::LiteralEqual,
+                                    ArrowOperator::NotEq => Matcher::LiteralNotEqual,
+                                    ArrowOperator::Like => {
+                                        |o: Option<&'a str>| Matcher::RegexMatch(o.unwrap())
+                                    }
+                                    ArrowOperator::NotLike => {
+                                        |o: Option<&'a str>| Matcher::RegexNotMatch(o.unwrap())
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                Ok(self.filter(
+                                    Filter {
+                                        name: column_name,
+                                        matcher: filterer(value.as_deref()),
+                                    },
+                                    pre_filtered,
+                                ))
+                            }
                             _ => Err(QueryError::WrongFilterValue { expr: *right }),
                         }
                     } else {
                         Err(QueryError::WrongFiltered { expr: *left })
                     }
                 }
-                // ArrowOperator::NotEq => {}
-                // ArrowOperator::Like => {}
-                // ArrowOperator::NotLike => {}
                 _ => Err(QueryError::WrongOperator { op }),
             }
         } else {
@@ -584,40 +619,29 @@ mod tests {
             .iter()
             .cloned()
             .collect::<HashMap<_, _>>();
-        {
-            let lock = chunk.columns.write().unwrap();
-            chunk.create_record(lock, labels.clone()).insert(
-                now + Duration::SECOND,
-                [("s1", Scalar::Int(1))].iter().cloned().collect(),
-            );
-            assert_eq!(chunk.stat.record_num.load(Ordering::SeqCst), 1);
-        }
+        chunk.lookup_or_insert(labels.clone()).insert(
+            now + Duration::SECOND,
+            [("s1", Scalar::Int(1))].iter().cloned().collect(),
+        );
+        assert_eq!(chunk.stat.record_num.load(Ordering::SeqCst), 1);
         let record = chunk.filter(
-            vec![Filter {
+            Filter {
                 name: "foo",
                 matcher: Matcher::LiteralEqual(Some("v1")),
-            }],
+            },
             None,
         );
         assert_eq!(record.iter().cloned().next(), Some(0));
-        {
-            let lock = chunk.on_write();
-            let record = chunk.lookup_or_insert(lock, labels.clone());
-            assert_eq!(record.id, 0);
-        }
-        {
-            let lock = chunk.on_write();
-            let record = chunk.lookup_or_insert(
-                lock,
-                [("foo", "v1")].iter().cloned().collect::<HashMap<_, _>>(),
-            );
-            assert_eq!(record.id, 1);
-        }
+        let record = chunk.lookup_or_insert(labels.clone());
+        assert_eq!(record.id, 0);
+        let record =
+            chunk.lookup_or_insert([("foo", "v1")].iter().cloned().collect::<HashMap<_, _>>());
+        assert_eq!(record.id, 1);
         let record = chunk.filter(
-            vec![Filter {
+            Filter {
                 name: "foo",
                 matcher: Matcher::LiteralEqual(Some("v1")),
-            }],
+            },
             None,
         );
         assert_eq!(record.len(), 2);
@@ -639,14 +663,11 @@ mod tests {
             .iter()
             .cloned()
             .collect::<HashMap<_, _>>();
-        {
-            let lock = chunk.columns.write().unwrap();
-            chunk.create_record(lock, labels.clone()).insert(
-                now + Duration::SECOND,
-                [("s1", Scalar::Int(1))].iter().cloned().collect(),
-            );
-            assert_eq!(chunk.stat.record_num.load(Ordering::SeqCst), 1);
-        }
+        chunk.lookup_or_insert(labels.clone()).insert(
+            now + Duration::SECOND,
+            [("s1", Scalar::Int(1))].iter().cloned().collect(),
+        );
+        assert_eq!(chunk.stat.record_num.load(Ordering::SeqCst), 1);
 
         let mut ctx = ExecutionContext::new();
         ctx.register_table("data", Arc::new(chunk)).unwrap();
