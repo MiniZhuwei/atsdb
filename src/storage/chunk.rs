@@ -1,6 +1,8 @@
 use crate::storage::error::QueryError;
 use crate::storage::query::Matcher;
 use crate::storage::util::dictionary::StringDictionary;
+use async_recursion::async_recursion;
+use async_trait::async_trait;
 use datafusion::arrow::array::{
     ArrayRef, Float64Builder, Int64Builder, ListBuilder, StringArray as ArrowStringArray,
 };
@@ -8,7 +10,7 @@ use datafusion::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema, SchemaRef,
 };
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::datasource::datasource::{Statistics, TableProviderFilterPushDown};
+use datafusion::datasource::datasource::TableProviderFilterPushDown;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_plan::{combine_filters, Expr, Operator as ArrowOperator};
@@ -21,6 +23,7 @@ use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
+use tokio::join;
 
 #[derive(Debug)]
 struct Row<'a> {
@@ -333,8 +336,11 @@ impl<'a> MutableChunk {
     }
 
     fn filter(&self, filter: Filter, pre_filtered: Option<HashSet<usize>>) -> HashSet<usize> {
-        let columns = self.on_read();
-        return columns.filter_label(filter, pre_filtered);
+        return self
+            .columns
+            .read()
+            .unwrap()
+            .filter_label(filter, pre_filtered);
     }
 
     fn lookup_or_insert(&'a self, labels: HashMap<&str, &str>) -> Row<'a> {
@@ -424,7 +430,7 @@ impl<'a> MutableChunk {
             }
         }
         return RecordBatch::try_new(Arc::new(Schema::new(fields)), arrow_arrays)
-            .map_err(|err| QueryError::DataFusionError { err });
+            .map_err(|err| QueryError::ArrowError { err });
     }
 
     fn on_read(&self) -> RwLockReadGuard<Columns> {
@@ -436,11 +442,11 @@ impl<'a> MutableChunk {
     }
 
     fn get_schema(&self) -> SchemaRef {
-        let columns = self.on_read();
-        return SchemaRef::from(Schema::new(columns.arrows.clone()));
+        return SchemaRef::from(Schema::new(self.on_read().arrows.clone()));
     }
 
-    fn datafusion_scan(
+    #[async_recursion]
+    async fn datafusion_scan(
         &self,
         predicate: Expr,
         pre_filtered: Option<HashSet<usize>>,
@@ -448,22 +454,23 @@ impl<'a> MutableChunk {
         return if let Expr::BinaryExpr { left, op, right } = predicate {
             match op {
                 ArrowOperator::And => {
-                    let left = self.datafusion_scan(*left, None)?;
-                    self.datafusion_scan(*right, Some(left))
+                    let left = self.datafusion_scan(*left, None).await?;
+                    self.datafusion_scan(*right, Some(left)).await
                 }
                 ArrowOperator::Or => {
-                    let left = self.datafusion_scan(*left, None)?;
-                    let right = self.datafusion_scan(*right, None)?;
-                    Ok(left.union(&right).cloned().collect())
+                    let (left, right) = join!(
+                        self.datafusion_scan(*left, None),
+                        self.datafusion_scan(*right, None)
+                    );
+                    Ok(left?.union(&right?).cloned().collect())
                 }
                 ArrowOperator::Eq
                 | ArrowOperator::NotEq
                 | ArrowOperator::Like
                 | ArrowOperator::NotLike => {
-                    let columns = self.on_read();
                     if let box Expr::Column(column) = left {
                         let column_name = column.name.as_str();
-                        if !columns.labels.contains_key(column_name) {
+                        if !self.on_read().labels.contains_key(column_name) {
                             return Err(QueryError::NoSuchScalar { name: column.name });
                         }
                         match right {
@@ -501,6 +508,7 @@ impl<'a> MutableChunk {
     }
 }
 
+#[async_trait]
 impl TableProvider for MutableChunk {
     fn as_any(&self) -> &dyn Any {
         return self;
@@ -510,21 +518,21 @@ impl TableProvider for MutableChunk {
         return self.get_schema();
     }
 
-    fn scan(
+    async fn scan(
         &self,
         projection: &Option<Vec<usize>>,
         _batch_size: usize,
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let columns = self.on_read();
         let column_ids = match projection {
             Some(ids) => ids.clone(),
-            None => (0..columns.arrows.len()).collect(),
+            None => (0..self.on_read().arrows.len()).collect(),
         };
         let predicate = combine_filters(filters);
         let record_ids = if let Some(predicate) = predicate {
             self.datafusion_scan(predicate, None)
+                .await
                 .map_err(|err| DataFusionError::Execution(format!("{:?}", err)))?
         } else {
             (0..self.stat.record_num.load(Ordering::SeqCst)).collect()
@@ -538,14 +546,6 @@ impl TableProvider for MutableChunk {
             schema,
             projection.clone(),
         )?));
-    }
-
-    fn statistics(&self) -> Statistics {
-        todo!()
-    }
-
-    fn has_exact_statistics(&self) -> bool {
-        return true;
     }
 
     fn supports_filter_pushdown(&self, _: &Expr) -> DataFusionResult<TableProviderFilterPushDown> {
@@ -673,6 +673,7 @@ mod tests {
         ctx.register_table("data", Arc::new(chunk)).unwrap();
         let sql_results = ctx
             .sql("select * from data where foo = 'v1' and bar = 'v2'")
+            .await
             .unwrap()
             .collect()
             .await

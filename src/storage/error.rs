@@ -1,5 +1,6 @@
 use datafusion::arrow::error::ArrowError;
-use datafusion::logical_plan::{Expr, Operator};
+use datafusion::error::DataFusionError;
+use datafusion::logical_plan::{Expr, LogicalPlan, Operator};
 use snafu::Snafu;
 
 #[derive(Snafu, Debug)]
@@ -19,5 +20,15 @@ pub enum QueryError {
     #[snafu(display("table does not have such scalar column: {}", name))]
     NoSuchScalar { name: String },
     #[snafu(display("datafusion error: {}", err))]
-    DataFusionError { err: ArrowError },
+    ArrowError { err: ArrowError },
+}
+
+#[derive(Snafu, Debug)]
+pub enum DBError {
+    #[snafu(display("datafusion error: {}", err))]
+    InternalError { err: DataFusionError },
+    #[snafu(display("only support filter sql, not: {:?}", plan))]
+    NoSupportLogicalPlan { plan: LogicalPlan },
+    #[snafu(display("only support filter sql, not: {:?}", err))]
+    OtherError { err: String },
 }
