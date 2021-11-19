@@ -659,36 +659,4 @@ mod tests {
         let chunk = create_test_chunk(now);
         println!("{:?}", chunk.schema());
     }
-
-    // #[tokio::test]
-    // async fn test_datafusion() {
-    //     let now = SystemTime::now();
-    //     let chunk = create_test_chunk(now);
-    //     let labels = [("foo", "v1"), ("bar", "v2")]
-    //         .iter()
-    //         .cloned()
-    //         .collect::<HashMap<_, _>>();
-    //     chunk.lookup_or_insert(labels.clone()).insert(
-    //         now + Duration::SECOND,
-    //         [("s1", Scalar::Int(1))].iter().cloned().collect(),
-    //     );
-    //     assert_eq!(chunk.stat.record_num.load(Ordering::SeqCst), 1);
-    //
-    //     let mut ctx = ExecutionContext::new();
-    //     ctx.register_table("data", Arc::new(chunk)).unwrap();
-    //     ctx.register_udf(make_range_udf());
-    //     ctx.register_udf(make_time_udf());
-    //     let sql_results = ctx
-    //         .sql(&*format!(
-    //             "select * from data where range(datetime('{}'), datetime('{}'), foo = 'v1' and bar = 'v2')",
-    //             DateTime::<Utc>::from(now).to_rfc3339(),
-    //             DateTime::<Utc>::from(now + Duration::SECOND).to_rfc3339())
-    //         )
-    //         .await
-    //         .unwrap()
-    //         .collect()
-    //         .await
-    //         .unwrap();
-    //     println!("{:?}", sql_results);
-    // }
 }

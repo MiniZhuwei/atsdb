@@ -25,7 +25,7 @@ impl StringDictionary {
     }
 
     pub fn lookup(&self, value: &str) -> Option<usize> {
-        return self.dedup.get(value).and_then(|x| Some(x.to_owned()));
+        return self.dedup.get(value).map(|x| x.to_owned());
     }
 
     pub fn get(&self, id: usize) -> Option<&str> {
