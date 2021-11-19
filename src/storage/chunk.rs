@@ -2,7 +2,6 @@ use crate::storage::error::QueryError;
 use crate::storage::query::Matcher;
 use crate::storage::util::dictionary::StringDictionary;
 use async_recursion::async_recursion;
-use async_trait::async_trait;
 use datafusion::arrow::array::{
     ArrayRef, Float64Builder, Int64Builder, ListBuilder, StringArray as ArrowStringArray,
 };
@@ -10,23 +9,18 @@ use datafusion::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema, SchemaRef,
 };
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::datasource::datasource::TableProviderFilterPushDown;
-use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_plan::{combine_filters, Expr, Operator as ArrowOperator};
-use datafusion::physical_plan::memory::MemoryExec;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::scalar::ScalarValue;
 use hashbrown::{HashMap, HashSet};
 use regex::Regex;
-use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 use tokio::join;
 
 #[derive(Debug)]
-struct Row<'a> {
+pub struct Row<'a> {
     chunk: &'a MutableChunk,
     id: usize,
 }
@@ -36,12 +30,14 @@ impl<'a> Row<'a> {
         return Self { id, chunk };
     }
 
-    fn insert(&self, timestamp: Instant, scalars: HashMap<&str, Scalar>) {
+    pub fn insert(&self, timestamp: SystemTime, scalars: HashMap<&str, Scalar>) {
         let mut columns = self.chunk.columns.write().unwrap();
         for (name, column) in columns.scalars.iter_mut() {
             let series = column.get(self.id).unwrap();
             let scalar = scalars.get(name.as_ref()).cloned();
-            let index = (timestamp - self.chunk.info.start_at)
+            let index = timestamp
+                .duration_since(self.chunk.info.start_at)
+                .unwrap()
                 .div_duration_f64(self.chunk.info.time_interval) as u32;
             match series {
                 ScalarType::Int(series) => series
@@ -79,12 +75,12 @@ impl<G: 'static + Default + Clone + Copy> Series<G> {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ScalarType<T, G> {
+pub enum ScalarType<T, G> {
     Int(T),
     Float(G),
 }
 
-type Scalar = ScalarType<i64, f64>;
+pub type Scalar = ScalarType<i64, f64>;
 
 impl From<Scalar> for f64 {
     #[inline]
@@ -274,14 +270,14 @@ impl Columns {
 
 #[derive(Debug)]
 pub struct MutableChunk {
-    info: ChunkInfo,
+    pub info: ChunkInfo,
     stat: ChunkStat,
 
     columns: Arc<RwLock<Columns>>,
 }
 
 impl<'a> MutableChunk {
-    fn new(start_at: Instant, time_interval: Duration, series_len: u32) -> Self {
+    pub fn new(start_at: SystemTime, time_interval: Duration, series_len: u32) -> Self {
         return Self {
             info: ChunkInfo::new(start_at, time_interval, series_len),
             stat: ChunkStat::new(),
@@ -289,7 +285,7 @@ impl<'a> MutableChunk {
         };
     }
 
-    fn set_schema(&mut self, labels: Vec<&str>, scalars: Vec<ScalarType<&str, &str>>) {
+    pub fn set_schema(&mut self, labels: Vec<&str>, scalars: Vec<ScalarType<&str, &str>>) {
         let mut columns = self.on_write();
 
         for name in labels.into_iter() {
@@ -343,7 +339,7 @@ impl<'a> MutableChunk {
             .filter_label(filter, pre_filtered);
     }
 
-    fn lookup_or_insert(&'a self, labels: HashMap<&str, &str>) -> Row<'a> {
+    pub fn lookup_or_insert(&'a self, labels: HashMap<&str, &str>) -> Row<'a> {
         let mut pre_filtered = None;
         let lock = self.columns.write().unwrap();
         for column_name in lock.labels.keys() {
@@ -369,8 +365,12 @@ impl<'a> MutableChunk {
     fn to_arrow(
         &self,
         projection: Vec<usize>,
-        ids: &HashSet<usize>,
+        ids: HashSet<usize>,
+        start_at: SystemTime,
+        end_at: SystemTime,
     ) -> Result<RecordBatch, QueryError> {
+        let start_at = self.get_time_offset(start_at, 0) as usize;
+        let end_at = self.get_time_offset(end_at, self.info.series_len) as usize;
         let mut fields = Vec::new();
         let mut arrow_arrays = Vec::<ArrayRef>::new();
         let columns = self.on_read();
@@ -407,7 +407,10 @@ impl<'a> MutableChunk {
                                 let mut builder = ListBuilder::new(Int64Builder::new(
                                     self.info.series_len as usize,
                                 ));
-                                for scalar in series.read().unwrap().iter() {
+                                for scalar in series.read().unwrap().data[start_at..end_at]
+                                    .iter()
+                                    .cloned()
+                                {
                                     builder.values().append_option(scalar).unwrap();
                                 }
                                 builder.append(true).unwrap();
@@ -417,7 +420,10 @@ impl<'a> MutableChunk {
                                 let mut builder = ListBuilder::new(Float64Builder::new(
                                     self.info.series_len as usize,
                                 ));
-                                for scalar in series.read().unwrap().iter() {
+                                for scalar in series.read().unwrap().data[start_at..end_at]
+                                    .iter()
+                                    .cloned()
+                                {
                                     builder.values().append_option(scalar).unwrap();
                                 }
                                 builder.append(true).unwrap();
@@ -441,28 +447,28 @@ impl<'a> MutableChunk {
         return self.columns.write().unwrap();
     }
 
-    fn get_schema(&self) -> SchemaRef {
+    pub fn schema(&self) -> SchemaRef {
         return SchemaRef::from(Schema::new(self.on_read().arrows.clone()));
     }
 
     #[async_recursion]
     async fn datafusion_scan(
-        &self,
-        predicate: Expr,
+        self: Arc<Self>,
+        predicate: Box<Expr>,
         pre_filtered: Option<HashSet<usize>>,
     ) -> Result<HashSet<usize>, QueryError> {
-        return if let Expr::BinaryExpr { left, op, right } = predicate {
+        return if let box Expr::BinaryExpr { left, op, right } = predicate {
             match op {
                 ArrowOperator::And => {
-                    let left = self.datafusion_scan(*left, None).await?;
-                    self.datafusion_scan(*right, Some(left)).await
+                    let left = Arc::clone(&self).datafusion_scan(left, None).await?;
+                    Arc::clone(&self).datafusion_scan(right, Some(left)).await
                 }
                 ArrowOperator::Or => {
                     let (left, right) = join!(
-                        self.datafusion_scan(*left, None),
-                        self.datafusion_scan(*right, None)
+                        tokio::spawn(Arc::clone(&self).datafusion_scan(left, None)),
+                        tokio::spawn(Arc::clone(&self).datafusion_scan(right, None))
                     );
-                    Ok(left?.union(&right?).cloned().collect())
+                    Ok(left.unwrap()?.union(&right.unwrap()?).cloned().collect())
                 }
                 ArrowOperator::Eq
                 | ArrowOperator::NotEq
@@ -503,70 +509,69 @@ impl<'a> MutableChunk {
                 _ => Err(QueryError::WrongOperator { op }),
             }
         } else {
-            Err(QueryError::WrongExpression { expr: predicate })
+            Err(QueryError::WrongExpression { expr: *predicate })
         };
     }
-}
 
-#[async_trait]
-impl TableProvider for MutableChunk {
-    fn as_any(&self) -> &dyn Any {
-        return self;
+    fn get_time_offset(&self, timestamp: SystemTime, default: u32) -> u32 {
+        return timestamp
+            .duration_since(self.info.start_at)
+            .ok()
+            .map(|duration| duration.div_duration_f64(self.info.time_interval) as u32)
+            .unwrap_or(default);
     }
 
-    fn schema(&self) -> SchemaRef {
-        return self.get_schema();
-    }
-
-    async fn scan(
-        &self,
-        projection: &Option<Vec<usize>>,
+    pub async fn scan(
+        self: Arc<Self>,
+        projection: Arc<Vec<ArrowField>>,
         _batch_size: usize,
-        filters: &[Expr],
+        filters: Arc<Option<Expr>>,
         _limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let column_ids = match projection {
-            Some(ids) => ids.clone(),
-            None => (0..self.on_read().arrows.len()).collect(),
-        };
-        let predicate = combine_filters(filters);
-        let record_ids = if let Some(predicate) = predicate {
-            self.datafusion_scan(predicate, None)
-                .await
-                .map_err(|err| DataFusionError::Execution(format!("{:?}", err)))?
+        start_at: SystemTime,
+        end_at: SystemTime,
+    ) -> Result<RecordBatch, QueryError> {
+        let column_ids = projection
+            .iter()
+            .filter_map(|field| {
+                self.columns
+                    .read()
+                    .unwrap()
+                    .arrows
+                    .iter()
+                    .enumerate()
+                    .find(|(_, f)| *f == field)
+                    .map(|(id, _)| id)
+            })
+            .collect::<Vec<_>>();
+        let record_ids = if let Some(filters) = filters.as_ref() {
+            Arc::clone(&self)
+                .datafusion_scan(Box::new(filters.clone()), None)
+                .await?
         } else {
             (0..self.stat.record_num.load(Ordering::SeqCst)).collect()
         };
-        let partition = self
-            .to_arrow(column_ids, &record_ids)
-            .map_err(|err| DataFusionError::Execution(format!("{:?}", err)))?;
-        let schema = Arc::<datafusion::arrow::datatypes::Schema>::clone(&partition.schema());
-        return Ok(Arc::new(MemoryExec::try_new(
-            &[vec![partition]],
-            schema,
-            projection.clone(),
-        )?));
-    }
-
-    fn supports_filter_pushdown(&self, _: &Expr) -> DataFusionResult<TableProviderFilterPushDown> {
-        return Ok(TableProviderFilterPushDown::Exact);
+        return self.to_arrow(column_ids, record_ids, start_at, end_at);
     }
 }
 
 #[derive(Debug)]
-struct ChunkInfo {
-    start_at: Instant,
+pub struct ChunkInfo {
+    pub start_at: SystemTime,
     time_interval: Duration,
     series_len: u32,
 }
 
 impl ChunkInfo {
-    fn new(start_at: Instant, time_interval: Duration, series_len: u32) -> Self {
+    fn new(start_at: SystemTime, time_interval: Duration, series_len: u32) -> Self {
         return Self {
             start_at,
             time_interval,
             series_len,
         };
+    }
+
+    pub fn end_at(&self) -> SystemTime {
+        return self.start_at + self.time_interval * (self.series_len - 1);
     }
 }
 
@@ -595,14 +600,15 @@ impl ChunkStat {
 mod tests {
     use super::{Filter, MutableChunk};
     use crate::storage::chunk::{Scalar, ScalarType};
-    use crate::storage::query::Matcher;
+    use crate::storage::query::{make_range_udf, make_time_udf, Matcher};
+    use chrono::prelude::*;
     use datafusion::prelude::ExecutionContext;
     use hashbrown::HashMap;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, SystemTime};
 
-    fn create_test_chunk(now: Instant) -> MutableChunk {
+    fn create_test_chunk(now: SystemTime) -> MutableChunk {
         let mut chunk = MutableChunk::new(now, Duration::SECOND, 128);
         chunk.set_schema(
             vec!["foo", "bar"],
@@ -613,7 +619,7 @@ mod tests {
 
     #[test]
     fn test_storage() {
-        let now = Instant::now();
+        let now = SystemTime::now();
         let chunk = create_test_chunk(now);
         let labels = [("foo", "v1"), ("bar", "v2")]
             .iter()
@@ -649,35 +655,40 @@ mod tests {
 
     #[test]
     fn test_to_arrow() {
-        let now = Instant::now();
+        let now = SystemTime::now();
         let chunk = create_test_chunk(now);
-        println!("{:?}", chunk.get_schema());
+        println!("{:?}", chunk.schema());
     }
 
-    #[tokio::test]
-    async fn test_datafusion() {
-        let now = Instant::now();
-        let chunk = create_test_chunk(now);
-        println!("{:?}", chunk.get_schema());
-        let labels = [("foo", "v1"), ("bar", "v2")]
-            .iter()
-            .cloned()
-            .collect::<HashMap<_, _>>();
-        chunk.lookup_or_insert(labels.clone()).insert(
-            now + Duration::SECOND,
-            [("s1", Scalar::Int(1))].iter().cloned().collect(),
-        );
-        assert_eq!(chunk.stat.record_num.load(Ordering::SeqCst), 1);
-
-        let mut ctx = ExecutionContext::new();
-        ctx.register_table("data", Arc::new(chunk)).unwrap();
-        let sql_results = ctx
-            .sql("select * from data where foo = 'v1' and bar = 'v2'")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        println!("{:?}", sql_results);
-    }
+    // #[tokio::test]
+    // async fn test_datafusion() {
+    //     let now = SystemTime::now();
+    //     let chunk = create_test_chunk(now);
+    //     let labels = [("foo", "v1"), ("bar", "v2")]
+    //         .iter()
+    //         .cloned()
+    //         .collect::<HashMap<_, _>>();
+    //     chunk.lookup_or_insert(labels.clone()).insert(
+    //         now + Duration::SECOND,
+    //         [("s1", Scalar::Int(1))].iter().cloned().collect(),
+    //     );
+    //     assert_eq!(chunk.stat.record_num.load(Ordering::SeqCst), 1);
+    //
+    //     let mut ctx = ExecutionContext::new();
+    //     ctx.register_table("data", Arc::new(chunk)).unwrap();
+    //     ctx.register_udf(make_range_udf());
+    //     ctx.register_udf(make_time_udf());
+    //     let sql_results = ctx
+    //         .sql(&*format!(
+    //             "select * from data where range(datetime('{}'), datetime('{}'), foo = 'v1' and bar = 'v2')",
+    //             DateTime::<Utc>::from(now).to_rfc3339(),
+    //             DateTime::<Utc>::from(now + Duration::SECOND).to_rfc3339())
+    //         )
+    //         .await
+    //         .unwrap()
+    //         .collect()
+    //         .await
+    //         .unwrap();
+    //     println!("{:?}", sql_results);
+    // }
 }

@@ -2,6 +2,7 @@ use datafusion::arrow::error::ArrowError;
 use datafusion::error::DataFusionError;
 use datafusion::logical_plan::{Expr, LogicalPlan, Operator};
 use snafu::Snafu;
+use std::time::SystemTime;
 
 #[derive(Snafu, Debug)]
 pub enum QueryError {
@@ -21,6 +22,10 @@ pub enum QueryError {
     NoSuchScalar { name: String },
     #[snafu(display("datafusion error: {}", err))]
     ArrowError { err: ArrowError },
+    #[snafu(display("query must specify time ranging"))]
+    NoTimeRange,
+    #[snafu(display("wrong time range expression: {}", desc))]
+    WrongTimeRange { desc: String },
 }
 
 #[derive(Snafu, Debug)]
@@ -31,4 +36,16 @@ pub enum DBError {
     NoSupportLogicalPlan { plan: LogicalPlan },
     #[snafu(display("only support filter sql, not: {:?}", err))]
     OtherError { err: String },
+}
+
+#[derive(Snafu, Debug)]
+pub enum DBWriteError {
+    #[snafu(display(
+        "the timestamp: {:?} can not be insert, because the chunk is archived",
+        timestamp
+    ))]
+    ChunkArchived { timestamp: SystemTime },
+
+    #[snafu(display("update schema when error: {:?}", err))]
+    UpdateSchemaError { err: ArrowError },
 }

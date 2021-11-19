@@ -9,7 +9,13 @@
     clippy::clone_on_ref_ptr,
     clippy::future_not_send
 )]
+mod server;
 mod storage;
+
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     println!("Hello, world!");
