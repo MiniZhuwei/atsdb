@@ -20,9 +20,11 @@ use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Worker {
     runtime: Arc<Runtime>,
 }
@@ -48,6 +50,7 @@ impl Worker {
     }
 }
 
+#[derive(Debug)]
 struct Table {
     name: Arc<str>,
     mutable_chunks: Vec<Arc<MutableChunk>>,
@@ -79,8 +82,8 @@ impl Table {
     fn insert(
         &mut self,
         timestamp: SystemTime,
-        labels: HashMap<&str, &str>,
-        scalars: HashMap<&str, Scalar>,
+        labels: HashMap<String, String>,
+        scalars: HashMap<String, Scalar>,
     ) -> Result<(), DBWriteError> {
         let last_mutable_chunk = self.mutable_chunks.last();
         let writing = if last_mutable_chunk.is_none()
@@ -93,12 +96,12 @@ impl Table {
             let start_at = UNIX_EPOCH + self.info.series_len * self.info.time_interval * num as u32;
             let mut chunk = self.new_mutable_chunk(start_at);
             chunk.set_schema(
-                labels.keys().cloned().collect(),
+                labels.keys().map(String::as_ref).collect(),
                 scalars
                     .iter()
-                    .map(|(&key, value)| match value {
-                        ScalarType::Int(_) => ScalarType::Int(key),
-                        ScalarType::Float(_) => ScalarType::Float(key),
+                    .map(|(key, value)| match value {
+                        ScalarType::Int(_) => ScalarType::Int(key.as_ref()),
+                        ScalarType::Float(_) => ScalarType::Float(key.as_ref()),
                     })
                     .collect(),
             );
@@ -116,7 +119,7 @@ impl Table {
         return match writing {
             None => Err(DBWriteError::ChunkArchived { timestamp }),
             Some(chunk) => {
-                chunk.lookup_or_insert(labels).insert(timestamp, scalars);
+                chunk.lookup_or_insert(labels).insert(timestamp, &scalars);
                 Ok(())
             }
         };
@@ -136,7 +139,7 @@ impl Table {
         return self.mutable_chunks.get(offset).cloned();
     }
 
-    fn new_mutable_chunk(&mut self, start_at: SystemTime) -> MutableChunk {
+    fn new_mutable_chunk(&self, start_at: SystemTime) -> MutableChunk {
         return MutableChunk::new(start_at, self.info.time_interval, self.info.series_len);
     }
 
@@ -149,7 +152,7 @@ impl Table {
     }
 
     fn archive(&mut self) {
-        let archived = self.mutable_chunks.drain(0..1).next().unwrap();
+        let _archived = self.mutable_chunks.drain(0..1).next().unwrap();
         todo!()
     }
 
@@ -158,7 +161,7 @@ impl Table {
         let logical_pan = ctx
             .create_logical_plan(sql)
             .map_err(|err| DBError::InternalError { err })?;
-        let plan = ctx
+        let _plan = ctx
             .optimize(&logical_pan)
             .map_err(|err| DBError::InternalError { err })?;
         todo!()
@@ -263,6 +266,7 @@ impl TableProvider for Table {
     }
 }
 
+#[derive(Debug)]
 struct TableInfo {
     series_len: u32,
     time_interval: Duration,
@@ -275,42 +279,38 @@ impl TableInfo {
     }
 }
 
-struct DB {
-    name: Arc<str>,
-    tables: Arc<RwLock<HashMap<Arc<str>, Table>>>,
+#[derive(Debug)]
+pub struct DB {
+    tables: Arc<RwLock<HashMap<Arc<str>, (Arc<RwLock<Table>>, Arc<mpsc::Sender<InsertRequest>>)>>>,
 
     query_worker: Worker,
     write_worker: Worker,
+
+    default_series_len: u32,
+    default_time_interval: Duration,
+    default_mutable_chunk_num: usize,
 }
 
 impl DB {
-    fn new(name: &str, query_worker_num: usize, write_worker_num: usize) -> Self {
+    pub fn new(
+        query_worker_num: usize,
+        write_worker_num: usize,
+        default_series_len: u32,
+        default_time_interval: Duration,
+        default_mutable_chunk_num: usize,
+    ) -> Self {
         return Self {
-            name: Arc::from(name),
             tables: Arc::new(RwLock::new(HashMap::new())),
             query_worker: Worker::new(query_worker_num),
             write_worker: Worker::new(write_worker_num),
+
+            default_series_len,
+            default_time_interval,
+            default_mutable_chunk_num,
         };
     }
 
-    fn create_table(
-        &mut self,
-        name: &str,
-        series_len: u32,
-        time_interval: Duration,
-        mutable_chunk_num: usize,
-    ) {
-        let table_name = Arc::from(name);
-        let table = Table::new(
-            Arc::clone(&table_name),
-            series_len,
-            time_interval,
-            mutable_chunk_num,
-        );
-        self.tables.write().unwrap().insert(table_name, table);
-    }
-
-    async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, DBError> {
+    pub async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, DBError> {
         let ctx = ExecutionContext::new();
         let logical_pan = ctx
             .create_logical_plan(sql)
@@ -331,13 +331,77 @@ impl DB {
         };
     }
 
-    async fn insert(
-        &mut self,
+    pub async fn insert(
+        &self,
+        table_name: &str,
         timestamp: SystemTime,
-        labels: HashMap<&str, &str>,
-        scalars: HashMap<&str, Scalar>,
-    ) {
+        labels: HashMap<String, String>,
+        scalars: HashMap<String, Scalar>,
+    ) -> Result<(), DBWriteError> {
+        let name = Arc::from(table_name);
+        let rx = {
+            let mut tables = self.tables.write().unwrap();
+            let entry = tables.entry(Arc::clone(&name));
+            let (_, rx) = entry.or_insert_with(|| {
+                self.create_table(
+                    name,
+                    self.default_series_len,
+                    self.default_time_interval,
+                    self.default_mutable_chunk_num,
+                )
+            });
+            Arc::clone(rx)
+        };
+        let (ret, recv) = oneshot::channel::<Result<(), DBWriteError>>();
+        rx.send(InsertRequest {
+            timestamp,
+            labels,
+            scalars,
+            ret,
+        })
+        .await
+        .map_err(|err| DBWriteError::DBInternalError {
+            desc: format!("{}", err),
+        })?;
+        return recv.await.unwrap();
     }
+
+    fn create_table(
+        &self,
+        table_name: Arc<str>,
+        series_len: u32,
+        time_interval: Duration,
+        mutable_chunk_num: usize,
+    ) -> (Arc<RwLock<Table>>, Arc<mpsc::Sender<InsertRequest>>) {
+        let table = Arc::new(RwLock::new(Table::new(
+            table_name,
+            series_len,
+            time_interval,
+            mutable_chunk_num,
+        )));
+        let (tx, mut rx) = mpsc::channel::<InsertRequest>(1);
+        let table_worker = Arc::clone(&table);
+        self.write_worker.spawn(async move {
+            while let Some(request) = rx.recv().await {
+                request
+                    .ret
+                    .send(table_worker.write().unwrap().insert(
+                        request.timestamp,
+                        request.labels,
+                        request.scalars,
+                    ))
+                    .unwrap_or_else(|err| panic!("{:?}", err));
+            }
+        });
+        return (table, Arc::new(tx));
+    }
+}
+
+struct InsertRequest {
+    timestamp: SystemTime,
+    labels: HashMap<String, String>,
+    scalars: HashMap<String, Scalar>,
+    ret: oneshot::Sender<Result<(), DBWriteError>>,
 }
 
 #[cfg(test)]
@@ -355,14 +419,20 @@ mod tests {
     async fn test_query() {
         let now = SystemTime::now();
         let mut table = Table::new(Arc::from("test"), 128, Duration::SECOND, 1);
-        let labels = [("hefei", "miemie"), ("yueyang", "momo")]
-            .iter()
-            .cloned()
-            .collect::<HashMap<_, _>>();
-        let scalars = [("v1", Scalar::Int(1)), ("v2", Scalar::Float(0.1))]
-            .iter()
-            .cloned()
-            .collect::<HashMap<_, _>>();
+        let labels = [
+            ("hefei".to_string(), "miemie".to_string()),
+            ("yueyang".to_string(), "momo".to_string()),
+        ]
+        .iter()
+        .cloned()
+        .collect::<HashMap<_, _>>();
+        let scalars = [
+            ("v1".to_string(), Scalar::Int(1)),
+            ("v2".to_string(), Scalar::Float(0.1)),
+        ]
+        .iter()
+        .cloned()
+        .collect::<HashMap<_, _>>();
         table.insert(now, labels, scalars).unwrap();
         println!("{:?}", table.mutable_chunks);
 

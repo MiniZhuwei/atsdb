@@ -1,9 +1,11 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
-        .build_client(false)
+        .build_client(true)
+        .build_server(true)
+        .out_dir("src/server/proto")
         .compile(
-            &["src/server/idl/opentelemetry-proto/opentelemetry/proto/collector/metrics/v1/metrics_service.proto"],
-                 &["src/server/idl/opentelemetry-proto"]
+            &["src/server/idl/atsdb/proto/service.proto"],
+            &["src/server/idl/atsdb"],
         )?;
     Ok(())
 }

@@ -9,8 +9,7 @@ use datafusion::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema, SchemaRef,
 };
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::logical_plan::{combine_filters, Expr, Operator as ArrowOperator};
+use datafusion::logical_plan::{Expr, Operator as ArrowOperator};
 use datafusion::scalar::ScalarValue;
 use hashbrown::{HashMap, HashSet};
 use regex::Regex;
@@ -30,7 +29,7 @@ impl<'a> Row<'a> {
         return Self { id, chunk };
     }
 
-    pub fn insert(&self, timestamp: SystemTime, scalars: HashMap<&str, Scalar>) {
+    pub fn insert(&self, timestamp: SystemTime, scalars: &HashMap<String, Scalar>) {
         let mut columns = self.chunk.columns.write().unwrap();
         for (name, column) in columns.scalars.iter_mut() {
             let series = column.get(self.id).unwrap();
@@ -314,7 +313,7 @@ impl<'a> MutableChunk {
     fn create_record(
         &'a self,
         mut lock: RwLockWriteGuard<'a, Columns>,
-        labels: HashMap<&str, &str>,
+        labels: HashMap<String, String>,
     ) -> Row<'a> {
         for (name, column) in lock.labels.iter_mut() {
             let label_value = labels.get(name.as_ref());
@@ -339,14 +338,16 @@ impl<'a> MutableChunk {
             .filter_label(filter, pre_filtered);
     }
 
-    pub fn lookup_or_insert(&'a self, labels: HashMap<&str, &str>) -> Row<'a> {
+    pub fn lookup_or_insert(&'a self, labels: HashMap<String, String>) -> Row<'a> {
         let mut pre_filtered = None;
         let lock = self.columns.write().unwrap();
         for column_name in lock.labels.keys() {
             pre_filtered = Some(lock.filter_label(
                 Filter {
                     name: column_name,
-                    matcher: Matcher::LiteralEqual(labels.get(column_name.as_ref()).cloned()),
+                    matcher: Matcher::LiteralEqual(
+                        labels.get(column_name.as_ref()).map(String::as_ref),
+                    ),
                 },
                 pre_filtered,
             ));
@@ -601,11 +602,8 @@ mod tests {
     use super::{Filter, MutableChunk};
     use crate::storage::chunk::{Scalar, ScalarType};
     use crate::storage::query::{make_range_udf, make_time_udf, Matcher};
-    use chrono::prelude::*;
-    use datafusion::prelude::ExecutionContext;
     use hashbrown::HashMap;
     use std::sync::atomic::Ordering;
-    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     fn create_test_chunk(now: SystemTime) -> MutableChunk {
@@ -621,14 +619,19 @@ mod tests {
     fn test_storage() {
         let now = SystemTime::now();
         let chunk = create_test_chunk(now);
-        let labels = [("foo", "v1"), ("bar", "v2")]
+        let labels = [
+            (String::from("foo"), String::from("v1")),
+            (String::from("bar"), String::from("v2")),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        let scalars = [(String::from("s1"), Scalar::Int(1))]
             .iter()
             .cloned()
-            .collect::<HashMap<_, _>>();
-        chunk.lookup_or_insert(labels.clone()).insert(
-            now + Duration::SECOND,
-            [("s1", Scalar::Int(1))].iter().cloned().collect(),
-        );
+            .collect();
+        chunk
+            .lookup_or_insert(labels.clone())
+            .insert(now + Duration::SECOND, &scalars);
         assert_eq!(chunk.stat.record_num.load(Ordering::SeqCst), 1);
         let record = chunk.filter(
             Filter {
@@ -640,8 +643,11 @@ mod tests {
         assert_eq!(record.iter().cloned().next(), Some(0));
         let record = chunk.lookup_or_insert(labels.clone());
         assert_eq!(record.id, 0);
-        let record =
-            chunk.lookup_or_insert([("foo", "v1")].iter().cloned().collect::<HashMap<_, _>>());
+        let record = chunk.lookup_or_insert(
+            [(String::from("foo"), String::from("v1"))]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
         assert_eq!(record.id, 1);
         let record = chunk.filter(
             Filter {

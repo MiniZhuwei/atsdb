@@ -48,4 +48,7 @@ pub enum DBWriteError {
 
     #[snafu(display("update schema when error: {:?}", err))]
     UpdateSchemaError { err: ArrowError },
+
+    #[snafu(display("db write internal error: {:?}", desc))]
+    DBInternalError { desc: String },
 }

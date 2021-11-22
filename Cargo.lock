@@ -138,6 +138,8 @@ dependencies = [
  "datafusion",
  "hashbrown",
  "mimalloc",
+ "num_cpus",
+ "prost",
  "regex",
  "snafu",
  "tokio",
