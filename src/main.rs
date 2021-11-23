@@ -24,13 +24,13 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let addr = "[::1]:1107".parse().unwrap();
+    let cpus = num_cpus::get();
 
     let rpc_runtime = Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(cpus)
         .enable_io()
         .build()
         .unwrap();
-    let cpus = num_cpus::get();
 
     rpc_runtime.block_on(async move {
         let server = RpcServer::new(cpus, cpus);

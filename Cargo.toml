@@ -9,8 +9,12 @@ name = "server"
 path = "src/main.rs"
 
 [[bin]]
-name = "benchmark-client"
-path = "src/main.rs"
+name = "benchmark-single-meesage"
+path = "bench/single-message.rs"
+
+[[bin]]
+name = "benchmark"
+path = "bench/bench.rs"
 
 [dependencies]
 hashbrown = "0.11.2"
@@ -25,6 +29,15 @@ mimalloc = { version = "0.1.27", default-features = false }
 tonic = "0.6.1"
 prost = "0.9"
 num_cpus = "1.13.0"
+rand = "0.8.4"
+roaring = "0.8.1"
 
 [build-dependencies]
 tonic-build = "0.6"
+
+[profile.release]
+debug = true
+lto = "thin"
+
+[profile.bench]
+debug = true

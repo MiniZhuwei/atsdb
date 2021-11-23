@@ -11,9 +11,11 @@ use datafusion::arrow::datatypes::{
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::logical_plan::{Expr, Operator as ArrowOperator};
 use datafusion::scalar::ScalarValue;
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 use regex::Regex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use roaring::RoaringBitmap;
+use std::ops::{BitAnd, BitOr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime};
 use tokio::join;
@@ -21,11 +23,11 @@ use tokio::join;
 #[derive(Debug)]
 pub struct Row<'a> {
     chunk: &'a MutableChunk,
-    id: usize,
+    id: u32,
 }
 
 impl<'a> Row<'a> {
-    fn new(chunk: &'a MutableChunk, id: usize) -> Self {
+    fn new(chunk: &'a MutableChunk, id: u32) -> Self {
         return Self { id, chunk };
     }
 
@@ -141,10 +143,10 @@ impl ScalarColumn {
         };
     }
 
-    fn get(&self, offset: usize) -> Option<ScalarType<&LockedSeries<i64>, &LockedSeries<f64>>> {
+    fn get(&self, offset: u32) -> Option<ScalarType<&LockedSeries<i64>, &LockedSeries<f64>>> {
         return match &self.data {
-            ScalarType::Int(data) => data.get(offset).map(ScalarType::Int),
-            ScalarType::Float(data) => data.get(offset).map(ScalarType::Float),
+            ScalarType::Int(data) => data.get(offset as usize).map(ScalarType::Int),
+            ScalarType::Float(data) => data.get(offset as usize).map(ScalarType::Float),
         };
     }
 }
@@ -153,13 +155,17 @@ impl ScalarColumn {
 struct LabelColumn {
     data: Vec<usize>,
     values: StringDictionary,
+    index: HashMap<usize, RoaringBitmap>,
 }
 
 impl LabelColumn {
     fn new() -> Self {
+        let mut hash_map = HashMap::new();
+        hash_map.insert(0, RoaringBitmap::new());
         return Self {
             data: Vec::new(),
             values: StringDictionary::new(),
+            index: hash_map,
         };
     }
 
@@ -170,10 +176,16 @@ impl LabelColumn {
     fn push(&mut self, s: &str) {
         let id = self.values.lookup_or_insert(s);
         self.data.push(id);
+        let entry = self.index.entry(id);
+        let bitmap = entry.or_insert_with(RoaringBitmap::new);
+        bitmap.insert(self.data.len() as u32 - 1);
     }
 
     fn push_zero(&mut self) {
         self.data.push(0);
+        self.index.entry(0).and_modify(|map| {
+            map.insert(self.data.len() as u32 - 1);
+        });
     }
 
     fn get(&self, id: usize) -> Option<&str> {
@@ -190,23 +202,15 @@ impl<'a> Filter<'a> {
     fn filter(
         &self,
         column: &'a LabelColumn,
-        pre_filtered: Option<HashSet<usize>>,
-    ) -> Option<Vec<usize>> {
-        let filter_id: Vec<_> = match pre_filtered {
-            Some(pre_filtered) => pre_filtered.into_iter().collect(),
-            None => (0..column.data.len()).into_iter().collect(),
-        };
-        let iter = filter_id
-            .into_iter()
-            .map(|id| *column.data.get(id).unwrap());
-
+        pre_filtered: Option<&'a RoaringBitmap>,
+    ) -> Option<RoaringBitmap> {
         let match_func: Box<dyn Fn(&(usize, usize)) -> bool> = match self.matcher {
             Matcher::LiteralEqual(v) => {
                 let sid = match v {
                     Some(s) => column.values.lookup(s)?,
                     None => 0,
                 };
-                Box::new(move |(_, record): &(usize, usize)| *record == sid)
+                return Some(column.index.get(&sid).unwrap().clone());
             }
             Matcher::LiteralNotEqual(v) => {
                 let sid = match v {
@@ -228,10 +232,15 @@ impl<'a> Filter<'a> {
                 })
             }
         };
+        let filter_id: Box<dyn Iterator<Item = u32>> = match pre_filtered {
+            Some(pre_filtered) => Box::new(pre_filtered.into_iter()),
+            None => Box::new(0..column.data.len() as u32),
+        };
+        let iter = filter_id.map(|id| *column.data.get(id as usize).unwrap());
         return Some(
             iter.enumerate()
                 .filter(match_func)
-                .map(|(id, _)| id)
+                .map(|(id, _)| id as u32)
                 .collect(),
         );
     }
@@ -249,21 +258,16 @@ impl Columns {
         return Default::default();
     }
 
-    fn filter_label(&self, filter: Filter, pre_filtered: Option<HashSet<usize>>) -> HashSet<usize> {
-        let mut pre_filtered = pre_filtered;
-        if let Some(records) = self.labels.get(filter.name).and_then(|column| {
-            filter.filter(
-                column,
-                pre_filtered.as_ref().map(|v| v.iter().cloned().collect()),
-            )
-        }) {
-            let set = records.iter().cloned().collect::<HashSet<_>>();
-            pre_filtered = match pre_filtered {
-                None => Some(set),
-                Some(inter) => Some(inter.intersection(&set).cloned().collect()),
-            };
-        }
-        return pre_filtered.unwrap_or_default();
+    fn filter_label(&self, filter: Filter, pre_filtered: Option<RoaringBitmap>) -> RoaringBitmap {
+        let records = self
+            .labels
+            .get(filter.name)
+            .and_then(|column| filter.filter(column, pre_filtered.as_ref()))
+            .map(|records| match pre_filtered {
+                Some(pre_filtered) => pre_filtered.bitand(records),
+                None => records,
+            });
+        return records.unwrap_or_default();
     }
 }
 
@@ -330,7 +334,7 @@ impl<'a> MutableChunk {
         return Row::new(self, self.stat.add_record_num(1));
     }
 
-    fn filter(&self, filter: Filter, pre_filtered: Option<HashSet<usize>>) -> HashSet<usize> {
+    fn filter(&self, filter: Filter, pre_filtered: Option<RoaringBitmap>) -> RoaringBitmap {
         return self
             .columns
             .read()
@@ -355,7 +359,6 @@ impl<'a> MutableChunk {
         return match pre_filtered {
             Some(set) => set
                 .iter()
-                .cloned()
                 .next()
                 .map(|id| Row::new(self, id))
                 .unwrap_or_else(|| self.create_record(lock, labels)),
@@ -366,7 +369,7 @@ impl<'a> MutableChunk {
     fn to_arrow(
         &self,
         projection: Vec<usize>,
-        ids: HashSet<usize>,
+        ids: RoaringBitmap,
         start_at: SystemTime,
         end_at: SystemTime,
     ) -> Result<RecordBatch, QueryError> {
@@ -391,8 +394,7 @@ impl<'a> MutableChunk {
                     )?;
                     arrow_arrays.push(Arc::new(ArrowStringArray::from(
                         ids.iter()
-                            .cloned()
-                            .map(|id| label_column.get(id))
+                            .map(|id| label_column.get(id as usize))
                             .collect::<Vec<_>>(),
                     )));
                 }
@@ -402,7 +404,7 @@ impl<'a> MutableChunk {
                             name: field.name().to_string(),
                         },
                     )?;
-                    for series in ids.iter().cloned().map(|id| scalar_column.get(id).unwrap()) {
+                    for series in ids.iter().map(|id| scalar_column.get(id).unwrap()) {
                         match series {
                             ScalarType::Int(series) => {
                                 let mut builder = ListBuilder::new(Int64Builder::new(
@@ -456,8 +458,8 @@ impl<'a> MutableChunk {
     async fn datafusion_scan(
         self: Arc<Self>,
         predicate: Box<Expr>,
-        pre_filtered: Option<HashSet<usize>>,
-    ) -> Result<HashSet<usize>, QueryError> {
+        pre_filtered: Option<RoaringBitmap>,
+    ) -> Result<RoaringBitmap, QueryError> {
         return if let box Expr::BinaryExpr { left, op, right } = predicate {
             match op {
                 ArrowOperator::And => {
@@ -469,7 +471,7 @@ impl<'a> MutableChunk {
                         tokio::spawn(Arc::clone(&self).datafusion_scan(left, None)),
                         tokio::spawn(Arc::clone(&self).datafusion_scan(right, None))
                     );
-                    Ok(left.unwrap()?.union(&right.unwrap()?).cloned().collect())
+                    Ok(left.unwrap()?.bitor(&right.unwrap()?))
                 }
                 ArrowOperator::Eq
                 | ArrowOperator::NotEq
@@ -578,21 +580,21 @@ impl ChunkInfo {
 
 #[derive(Debug)]
 struct ChunkStat {
-    record_num: AtomicUsize,
+    record_num: AtomicU32,
 }
 
 impl ChunkStat {
     fn new() -> Self {
         return Self {
-            record_num: AtomicUsize::new(0),
+            record_num: AtomicU32::new(0),
         };
     }
 
-    fn add_record_num(&self, n: usize) -> usize {
+    fn add_record_num(&self, n: u32) -> u32 {
         return self.record_num.fetch_add(n, Ordering::SeqCst);
     }
 
-    fn get_record_num(&self) -> usize {
+    fn get_record_num(&self) -> u32 {
         return self.record_num.load(Ordering::SeqCst);
     }
 }
@@ -640,7 +642,7 @@ mod tests {
             },
             None,
         );
-        assert_eq!(record.iter().cloned().next(), Some(0));
+        assert_eq!(record.iter().next(), Some(0));
         let record = chunk.lookup_or_insert(labels.clone());
         assert_eq!(record.id, 0);
         let record = chunk.lookup_or_insert(
