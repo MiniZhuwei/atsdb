@@ -156,17 +156,6 @@ impl Table {
         todo!()
     }
 
-    async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, DBError> {
-        let ctx = ExecutionContext::new();
-        let logical_pan = ctx
-            .create_logical_plan(sql)
-            .map_err(|err| DBError::InternalError { err })?;
-        let _plan = ctx
-            .optimize(&logical_pan)
-            .map_err(|err| DBError::InternalError { err })?;
-        todo!()
-    }
-
     fn datafusion_get_timestamp(expr: &Expr) -> Result<SystemTime, QueryError> {
         return if let Expr::Literal(ScalarValue::Utf8(Some(v))) = expr {
             DateTime::parse_from_rfc3339(v)
@@ -310,7 +299,7 @@ impl DB {
         };
     }
 
-    pub async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, DBError> {
+    pub async fn sql_query(&self, sql: &str) -> Result<Vec<RecordBatch>, DBError> {
         let ctx = ExecutionContext::new();
         let logical_pan = ctx
             .create_logical_plan(sql)
@@ -407,7 +396,7 @@ struct InsertRequest {
 #[cfg(test)]
 mod tests {
     use crate::storage::chunk::Scalar;
-    use crate::storage::db::Table;
+    use crate::storage::db::{Table, DB};
     use crate::storage::query::{make_range_udf, make_time_udf};
     use chrono::{DateTime, Utc};
     use datafusion::prelude::ExecutionContext;

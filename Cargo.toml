@@ -31,6 +31,7 @@ prost = "0.9"
 num_cpus = "1.13.0"
 rand = "0.8.4"
 roaring = "0.8.1"
+core_affinity = "0.5.10"
 
 [build-dependencies]
 tonic-build = "0.6"
