@@ -1,4 +1,4 @@
-use crate::storage::error::QueryError;
+use crate::storage::error::{DBWriteError, QueryError};
 use crate::storage::query::Matcher;
 use crate::storage::util::dictionary::StringDictionary;
 use async_recursion::async_recursion;
@@ -22,33 +22,26 @@ use tokio::join;
 
 #[derive(Debug)]
 pub struct Row<'a> {
-    chunk: &'a MutableChunk,
+    chunk: &'a mut MutableChunk,
     id: u32,
 }
 
 impl<'a> Row<'a> {
-    fn new(chunk: &'a MutableChunk, id: u32) -> Self {
+    fn new(chunk: &'a mut MutableChunk, id: u32) -> Self {
         return Self { id, chunk };
     }
 
-    pub fn insert(&self, timestamp: SystemTime, scalars: &HashMap<String, Scalar>) {
-        let mut columns = self.chunk.columns.write().unwrap();
-        for (name, column) in columns.scalars.iter_mut() {
-            let series = column.get(self.id).unwrap();
+    pub fn insert(&mut self, timestamp: SystemTime, scalars: &HashMap<String, Scalar>) {
+        for (name, column) in self.chunk.columns.scalars.iter_mut() {
+            let series = column.get_mut(self.id).unwrap();
             let scalar = scalars.get(name.as_ref()).cloned();
             let index = timestamp
                 .duration_since(self.chunk.info.start_at)
                 .unwrap()
                 .div_duration_f64(self.chunk.info.time_interval) as u32;
             match series {
-                ScalarType::Int(series) => series
-                    .write()
-                    .unwrap()
-                    .insert(index, scalar.map(|s| s.into())),
-                ScalarType::Float(series) => series
-                    .write()
-                    .unwrap()
-                    .insert(index, scalar.map(|s| s.into())),
+                ScalarType::Int(series) => series.insert(index, scalar.map(|s| s.into())),
+                ScalarType::Float(series) => series.insert(index, scalar.map(|s| s.into())),
             }
         }
     }
@@ -103,12 +96,10 @@ impl From<Scalar> for i64 {
     }
 }
 
-type LockedSeries<G> = RwLock<Series<G>>;
-
 #[derive(Debug)]
 struct ScalarColumn {
     series_len: u32,
-    data: ScalarType<Vec<LockedSeries<i64>>, Vec<LockedSeries<f64>>>,
+    data: ScalarType<Vec<Series<i64>>, Vec<Series<f64>>>,
 }
 
 impl ScalarColumn {
@@ -128,25 +119,32 @@ impl ScalarColumn {
     fn resize(&mut self, to: u32) {
         match &mut self.data {
             ScalarType::Int(column) => {
-                column.resize_with(to as usize, || RwLock::new(Series::new(self.series_len)))
+                column.resize_with(to as usize, || Series::new(self.series_len))
             }
             ScalarType::Float(column) => {
-                column.resize_with(to as usize, || RwLock::new(Series::new(self.series_len)))
+                column.resize_with(to as usize, || Series::new(self.series_len))
             }
         };
     }
 
     fn push_zero(&mut self) {
         match &mut self.data {
-            ScalarType::Int(column) => column.push(RwLock::new(Series::new(self.series_len))),
-            ScalarType::Float(column) => column.push(RwLock::new(Series::new(self.series_len))),
+            ScalarType::Int(column) => column.push(Series::new(self.series_len)),
+            ScalarType::Float(column) => column.push(Series::new(self.series_len)),
         };
     }
 
-    fn get(&self, offset: u32) -> Option<ScalarType<&LockedSeries<i64>, &LockedSeries<f64>>> {
+    fn get(&self, offset: u32) -> Option<ScalarType<&Series<i64>, &Series<f64>>> {
         return match &self.data {
             ScalarType::Int(data) => data.get(offset as usize).map(ScalarType::Int),
             ScalarType::Float(data) => data.get(offset as usize).map(ScalarType::Float),
+        };
+    }
+
+    fn get_mut(&mut self, offset: u32) -> Option<ScalarType<&mut Series<i64>, &mut Series<f64>>> {
+        return match &mut self.data {
+            ScalarType::Int(data) => data.get_mut(offset as usize).map(ScalarType::Int),
+            ScalarType::Float(data) => data.get_mut(offset as usize).map(ScalarType::Float),
         };
     }
 }
@@ -276,7 +274,7 @@ pub struct MutableChunk {
     pub info: ChunkInfo,
     stat: ChunkStat,
 
-    columns: Arc<RwLock<Columns>>,
+    columns: Columns,
 }
 
 impl<'a> MutableChunk {
@@ -284,16 +282,16 @@ impl<'a> MutableChunk {
         return Self {
             info: ChunkInfo::new(start_at, time_interval, series_len),
             stat: ChunkStat::new(),
-            columns: Arc::new(RwLock::new(Columns::new())),
+            columns: Columns::new(),
         };
     }
 
     pub fn set_schema(&mut self, labels: Vec<&str>, scalars: Vec<ScalarType<&str, &str>>) {
-        let mut columns = self.on_write();
-
         for name in labels.into_iter() {
-            columns.labels.insert(Arc::from(name), LabelColumn::new());
-            columns
+            self.columns
+                .labels
+                .insert(Arc::from(name), LabelColumn::new());
+            self.columns
                 .arrows
                 .push(ArrowField::new(name, ArrowDataType::Utf8, true));
         }
@@ -302,11 +300,11 @@ impl<'a> MutableChunk {
                 ScalarType::Int(name) => (name, ScalarType::Int(()), ArrowDataType::Int64),
                 ScalarType::Float(name) => (name, ScalarType::Float(()), ArrowDataType::Float64),
             };
-            columns.scalars.insert(
+            self.columns.scalars.insert(
                 Arc::from(name),
                 ScalarColumn::new(scalar_type, self.info.series_len),
             );
-            columns.arrows.push(ArrowField::new(
+            self.columns.arrows.push(ArrowField::new(
                 name,
                 ArrowDataType::List(Box::new(ArrowField::new("item", arrow_type, true))),
                 false,
@@ -314,12 +312,8 @@ impl<'a> MutableChunk {
         }
     }
 
-    fn create_record(
-        &'a self,
-        mut lock: RwLockWriteGuard<'a, Columns>,
-        labels: HashMap<String, String>,
-    ) -> Row<'a> {
-        for (name, column) in lock.labels.iter_mut() {
+    fn create_record(&'a mut self, labels: HashMap<String, String>) -> Row<'a> {
+        for (name, column) in self.columns.labels.iter_mut() {
             let label_value = labels.get(name.as_ref());
             match label_value {
                 Some(v) => column.push(v),
@@ -327,7 +321,7 @@ impl<'a> MutableChunk {
             }
         }
 
-        for column in lock.scalars.values_mut() {
+        for column in self.columns.scalars.values_mut() {
             column.push_zero();
         }
 
@@ -335,18 +329,15 @@ impl<'a> MutableChunk {
     }
 
     fn filter(&self, filter: Filter, pre_filtered: Option<RoaringBitmap>) -> RoaringBitmap {
-        return self
-            .columns
-            .read()
-            .unwrap()
-            .filter_label(filter, pre_filtered);
+        return self.columns.filter_label(filter, pre_filtered);
     }
 
-    pub fn lookup_or_insert(&'a self, labels: HashMap<String, String>) -> Row<'a> {
+    pub fn test(&mut self) {}
+
+    pub fn lookup_or_insert(&'a mut self, labels: HashMap<String, String>) -> Row<'a> {
         let mut pre_filtered = None;
-        let lock = self.columns.write().unwrap();
-        for column_name in lock.labels.keys() {
-            pre_filtered = Some(lock.filter_label(
+        for column_name in self.columns.labels.keys() {
+            pre_filtered = Some(self.columns.filter_label(
                 Filter {
                     name: column_name,
                     matcher: Matcher::LiteralEqual(
@@ -357,12 +348,11 @@ impl<'a> MutableChunk {
             ));
         }
         return match pre_filtered {
-            Some(set) => set
-                .iter()
-                .next()
-                .map(|id| Row::new(self, id))
-                .unwrap_or_else(|| self.create_record(lock, labels)),
-            None => self.create_record(lock, labels),
+            Some(set) => match set.iter().next() {
+                Some(id) => Row::new(self, id),
+                None => self.create_record(labels),
+            },
+            None => self.create_record(labels),
         };
     }
 
@@ -377,17 +367,17 @@ impl<'a> MutableChunk {
         let end_at = self.get_time_offset(end_at, self.info.series_len) as usize;
         let mut fields = Vec::new();
         let mut arrow_arrays = Vec::<ArrayRef>::new();
-        let columns = self.on_read();
         // COMMENT(gwo): it is weired to use arrow types to identify the column belongs to label or scalar
         for column_id in projection.into_iter() {
-            let field = columns
+            let field = self
+                .columns
                 .arrows
                 .get(column_id)
                 .ok_or(QueryError::NoSuchColumn { id: column_id })?;
             fields.push(field.clone());
             match field.data_type() {
                 ArrowDataType::Utf8 => {
-                    let label_column = columns.labels.get(field.name().as_str()).ok_or(
+                    let label_column = self.columns.labels.get(field.name().as_str()).ok_or(
                         QueryError::NoSuchLabel {
                             name: field.name().to_string(),
                         },
@@ -399,7 +389,7 @@ impl<'a> MutableChunk {
                     )));
                 }
                 ArrowDataType::List(_) => {
-                    let scalar_column = columns.scalars.get(field.name().as_str()).ok_or(
+                    let scalar_column = self.columns.scalars.get(field.name().as_str()).ok_or(
                         QueryError::NoSuchScalar {
                             name: field.name().to_string(),
                         },
@@ -410,10 +400,7 @@ impl<'a> MutableChunk {
                                 let mut builder = ListBuilder::new(Int64Builder::new(
                                     self.info.series_len as usize,
                                 ));
-                                for scalar in series.read().unwrap().data[start_at..end_at]
-                                    .iter()
-                                    .cloned()
-                                {
+                                for scalar in series.data[start_at..end_at].iter().cloned() {
                                     builder.values().append_option(scalar).unwrap();
                                 }
                                 builder.append(true).unwrap();
@@ -423,10 +410,7 @@ impl<'a> MutableChunk {
                                 let mut builder = ListBuilder::new(Float64Builder::new(
                                     self.info.series_len as usize,
                                 ));
-                                for scalar in series.read().unwrap().data[start_at..end_at]
-                                    .iter()
-                                    .cloned()
-                                {
+                                for scalar in series.data[start_at..end_at].iter().cloned() {
                                     builder.values().append_option(scalar).unwrap();
                                 }
                                 builder.append(true).unwrap();
@@ -442,16 +426,8 @@ impl<'a> MutableChunk {
             .map_err(|err| QueryError::ArrowError { err });
     }
 
-    fn on_read(&self) -> RwLockReadGuard<Columns> {
-        return self.columns.read().unwrap();
-    }
-
-    fn on_write(&self) -> RwLockWriteGuard<Columns> {
-        return self.columns.write().unwrap();
-    }
-
     pub fn schema(&self) -> SchemaRef {
-        return SchemaRef::from(Schema::new(self.on_read().arrows.clone()));
+        return SchemaRef::from(Schema::new(self.columns.arrows.clone()));
     }
 
     #[async_recursion]
@@ -479,7 +455,7 @@ impl<'a> MutableChunk {
                 | ArrowOperator::NotLike => {
                     if let box Expr::Column(column) = left {
                         let column_name = column.name.as_str();
-                        if !self.on_read().labels.contains_key(column_name) {
+                        if !self.columns.labels.contains_key(column_name) {
                             return Err(QueryError::NoSuchScalar { name: column.name });
                         }
                         match right {
@@ -537,8 +513,6 @@ impl<'a> MutableChunk {
             .iter()
             .filter_map(|field| {
                 self.columns
-                    .read()
-                    .unwrap()
                     .arrows
                     .iter()
                     .enumerate()
@@ -620,7 +594,7 @@ mod tests {
     #[test]
     fn test_storage() {
         let now = SystemTime::now();
-        let chunk = create_test_chunk(now);
+        let mut chunk = create_test_chunk(now);
         let labels = [
             (String::from("foo"), String::from("v1")),
             (String::from("bar"), String::from("v2")),

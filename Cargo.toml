@@ -32,6 +32,9 @@ num_cpus = "1.13.0"
 rand = "0.8.4"
 roaring = "0.8.1"
 core_affinity = "0.5.10"
+tokio-util = "0.6.9"
+seahash = "4.1.0"
+skiplist = "0.4.0"
 
 [build-dependencies]
 tonic-build = "0.6"

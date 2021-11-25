@@ -1,6 +1,7 @@
 #![feature(box_patterns)]
 #![feature(div_duration)]
 #![feature(duration_constants)]
+#![feature(trait_alias)]
 #![allow(clippy::needless_return)]
 #![warn(
     missing_debug_implementations,
@@ -33,7 +34,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap();
 
     rpc_runtime.block_on(async move {
-        let server = RpcServer::new(cpus, cpus);
+        let server = RpcServer::new(cpus).await;
         Server::builder()
             .add_service(ServiceServer::new(server))
             .serve(addr)

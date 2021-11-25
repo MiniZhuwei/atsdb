@@ -1,27 +1,28 @@
 use crate::storage::chunk::{MutableChunk, Scalar, ScalarType};
 use crate::storage::error::{DBError, DBWriteError, QueryError};
-use async_trait::async_trait;
+use crate::storage::util::thread::CoreBoundWorkers;
 use chrono::DateTime;
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::dataframe::DataFrame;
-use datafusion::datasource::datasource::TableProviderFilterPushDown;
-use datafusion::datasource::TableProvider;
-use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::dataframe_impl::DataFrameImpl;
-use datafusion::logical_plan::{combine_filters, Expr, LogicalPlan};
-use datafusion::physical_plan::memory::MemoryExec;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::logical_plan::{Expr, LogicalPlan};
 use datafusion::prelude::ExecutionContext;
 use datafusion::scalar::ScalarValue;
 use hashbrown::HashMap;
-use std::any::Any;
+use std::borrow::BorrowMut;
+use std::cell::RefCell;
 use std::future::Future;
+use std::ops::Deref;
+use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
+use tokio::task;
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone)]
@@ -53,7 +54,7 @@ impl Worker {
 #[derive(Debug)]
 struct Table {
     name: Arc<str>,
-    mutable_chunks: Vec<Arc<MutableChunk>>,
+    mutable_chunks: Vec<Rc<RefCell<MutableChunk>>>,
     schema: Arc<Schema>,
 
     info: TableInfo,
@@ -87,7 +88,7 @@ impl Table {
     ) -> Result<(), DBWriteError> {
         let last_mutable_chunk = self.mutable_chunks.last();
         let writing = if last_mutable_chunk.is_none()
-            || timestamp > last_mutable_chunk.unwrap().info.end_at()
+            || timestamp > last_mutable_chunk.unwrap().borrow().info.end_at()
         {
             let num = timestamp
                 .duration_since(UNIX_EPOCH)
@@ -119,14 +120,18 @@ impl Table {
         return match writing {
             None => Err(DBWriteError::ChunkArchived { timestamp }),
             Some(chunk) => {
-                chunk.lookup_or_insert(labels).insert(timestamp, &scalars);
+                chunk
+                    .deref()
+                    .borrow_mut()
+                    .lookup_or_insert(labels)
+                    .insert(timestamp, &scalars);
                 Ok(())
             }
         };
     }
 
-    fn find_on_write_chunk(&mut self, timestamp: SystemTime) -> Option<Arc<MutableChunk>> {
-        let start_at = self.mutable_chunks.first().unwrap().info.start_at;
+    fn find_on_write_chunk(&mut self, timestamp: SystemTime) -> Option<Rc<RefCell<MutableChunk>>> {
+        let start_at = self.mutable_chunks.first().unwrap().borrow().info.start_at;
         if timestamp < start_at {
             return None;
         }
@@ -143,8 +148,8 @@ impl Table {
         return MutableChunk::new(start_at, self.info.time_interval, self.info.series_len);
     }
 
-    fn push_mutable_chunk(&mut self, chunk: MutableChunk) -> Option<Arc<MutableChunk>> {
-        self.mutable_chunks.push(Arc::new(chunk));
+    fn push_mutable_chunk(&mut self, chunk: MutableChunk) -> Option<Rc<RefCell<MutableChunk>>> {
+        self.mutable_chunks.push(Rc::new(RefCell::new(chunk)));
         if self.mutable_chunks.len() > self.info.mutable_chunk_num {
             self.archive();
         }
@@ -189,71 +194,71 @@ impl Table {
     }
 }
 
-#[async_trait]
-impl TableProvider for Table {
-    fn as_any(&self) -> &dyn Any {
-        return self;
-    }
-
-    fn schema(&self) -> SchemaRef {
-        return Arc::clone(&self.schema);
-    }
-
-    async fn scan(
-        &self,
-        projection: &Option<Vec<usize>>,
-        batch_size: usize,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let columns = match projection {
-            Some(ids) => Arc::new(
-                ids.iter()
-                    .cloned()
-                    .map(|id| self.schema.field(id).clone())
-                    .collect(),
-            ),
-            None => Arc::new(self.schema.fields().clone()),
-        };
-        let predicate = combine_filters(filters)
-            .ok_or_else(|| DataFusionError::Internal(format!("{:?}", QueryError::NoTimeRange)))?;
-        let (predicate, start_at, end_at) = self
-            .datafusion_range_expr(&predicate)
-            .map_err(|err| DataFusionError::Execution(format!("{:?}", err)))?;
-
-        let mut handlers = Vec::new();
-        for chunk in self.mutable_chunks.iter().cloned() {
-            if start_at > chunk.info.end_at() || end_at < chunk.info.start_at {
-                continue;
-            }
-            let columns = Arc::clone(&columns);
-            let predicate = Arc::clone(&predicate);
-            handlers.push(tokio::spawn(async move {
-                chunk
-                    .scan(columns, batch_size, predicate, limit, start_at, end_at)
-                    .await
-            }));
-        }
-        let mut partitions = Vec::new();
-        for handler in handlers {
-            partitions.push(
-                handler
-                    .await
-                    .unwrap()
-                    .map_err(|err| DataFusionError::Internal(format!("{:?}", err)))?,
-            );
-        }
-        return Ok(Arc::new(MemoryExec::try_new(
-            &[partitions],
-            Arc::new(Schema::new(columns.as_ref().clone())),
-            None,
-        )?));
-    }
-
-    fn supports_filter_pushdown(&self, _: &Expr) -> DataFusionResult<TableProviderFilterPushDown> {
-        return Ok(TableProviderFilterPushDown::Exact);
-    }
-}
+// #[async_trait]
+// impl TableProvider for Table {
+//     fn as_any(&self) -> &dyn Any {
+//         return self;
+//     }
+//
+//     fn schema(&self) -> SchemaRef {
+//         return Arc::clone(&self.schema);
+//     }
+//
+//     async fn scan(
+//         &self,
+//         projection: &Option<Vec<usize>>,
+//         batch_size: usize,
+//         filters: &[Expr],
+//         limit: Option<usize>,
+//     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+//         let columns = match projection {
+//             Some(ids) => Arc::new(
+//                 ids.iter()
+//                     .cloned()
+//                     .map(|id| self.schema.field(id).clone())
+//                     .collect(),
+//             ),
+//             None => Arc::new(self.schema.fields().clone()),
+//         };
+//         let predicate = combine_filters(filters)
+//             .ok_or_else(|| DataFusionError::Internal(format!("{:?}", QueryError::NoTimeRange)))?;
+//         let (predicate, start_at, end_at) = self
+//             .datafusion_range_expr(&predicate)
+//             .map_err(|err| DataFusionError::Execution(format!("{:?}", err)))?;
+//
+//         let mut handlers = Vec::new();
+//         for chunk in self.mutable_chunks.iter().cloned() {
+//             if start_at > chunk.info.end_at() || end_at < chunk.info.start_at {
+//                 continue;
+//             }
+//             let columns = Arc::clone(&columns);
+//             let predicate = Arc::clone(&predicate);
+//             handlers.push(tokio::spawn(async move {
+//                 chunk
+//                     .scan(columns, batch_size, predicate, limit, start_at, end_at)
+//                     .await
+//             }));
+//         }
+//         let mut partitions = Vec::new();
+//         for handler in handlers {
+//             partitions.push(
+//                 handler
+//                     .await
+//                     .unwrap()
+//                     .map_err(|err| DataFusionError::Internal(format!("{:?}", err)))?,
+//             );
+//         }
+//         return Ok(Arc::new(MemoryExec::try_new(
+//             &[partitions],
+//             Arc::new(Schema::new(columns.as_ref().clone())),
+//             None,
+//         )?));
+//     }
+//
+//     fn supports_filter_pushdown(&self, _: &Expr) -> DataFusionResult<TableProviderFilterPushDown> {
+//         return Ok(TableProviderFilterPushDown::Exact);
+//     }
+// }
 
 #[derive(Debug)]
 struct TableInfo {
@@ -270,28 +275,20 @@ impl TableInfo {
 
 #[derive(Debug)]
 pub struct DB {
-    tables: Arc<RwLock<HashMap<Arc<str>, (Arc<RwLock<Table>>, Arc<mpsc::Sender<InsertRequest>>)>>>,
-
-    query_worker: Worker,
-    write_worker: Worker,
-
+    tables: RefCell<HashMap<Arc<str>, Table>>,
     default_series_len: u32,
     default_time_interval: Duration,
     default_mutable_chunk_num: usize,
 }
 
 impl DB {
-    pub fn new(
-        query_worker_num: usize,
-        write_worker_num: usize,
+    fn new(
         default_series_len: u32,
         default_time_interval: Duration,
         default_mutable_chunk_num: usize,
     ) -> Self {
         return Self {
-            tables: Arc::new(RwLock::new(HashMap::new())),
-            query_worker: Worker::new(query_worker_num),
-            write_worker: Worker::new(write_worker_num),
+            tables: RefCell::new(HashMap::new()),
 
             default_series_len,
             default_time_interval,
@@ -299,7 +296,7 @@ impl DB {
         };
     }
 
-    pub async fn sql_query(&self, sql: &str) -> Result<Vec<RecordBatch>, DBError> {
+    async fn sql_query(&self, sql: &str) -> Result<Vec<RecordBatch>, DBError> {
         let ctx = ExecutionContext::new();
         let logical_pan = ctx
             .create_logical_plan(sql)
@@ -309,50 +306,39 @@ impl DB {
                 let plan = ctx
                     .optimize(&logical_pan)
                     .map_err(|err| DBError::InternalError { err })?;
-                Ok(self
-                    .query_worker
-                    .spawn(async move { DataFrameImpl::new(ctx.state, &plan).collect().await })
-                    .await
-                    .unwrap()
-                    .map_err(|err| DBError::InternalError { err })?)
+                Ok(task::spawn_local(async move {
+                    DataFrameImpl::new(ctx.state, &plan).collect().await
+                })
+                .await
+                .unwrap()
+                .map_err(|err| DBError::InternalError { err })?)
             }
             _ => Err(DBError::NoSupportLogicalPlan { plan: logical_pan }),
         };
     }
 
-    pub async fn insert(
+    fn insert(
         &self,
-        table_name: &str,
+        table_name: Arc<str>,
         timestamp: SystemTime,
         labels: HashMap<String, String>,
         scalars: HashMap<String, Scalar>,
     ) -> Result<(), DBWriteError> {
-        let name = Arc::from(table_name);
-        let rx = {
-            let mut tables = self.tables.write().unwrap();
-            let entry = tables.entry(Arc::clone(&name));
-            let (_, rx) = entry.or_insert_with(|| {
-                self.create_table(
-                    name,
-                    self.default_series_len,
-                    self.default_time_interval,
-                    self.default_mutable_chunk_num,
-                )
-            });
-            Arc::clone(rx)
-        };
-        let (ret, recv) = oneshot::channel::<Result<(), DBWriteError>>();
-        rx.send(InsertRequest {
-            timestamp,
-            labels,
-            scalars,
-            ret,
-        })
-        .await
-        .map_err(|err| DBWriteError::DBInternalError {
-            desc: format!("{}", err),
-        })?;
-        return recv.await.unwrap();
+        let mut table = self.tables.borrow_mut();
+        let entry = table.entry(Arc::clone(&table_name));
+        let table = entry.or_insert_with(|| {
+            self.create_table(
+                table_name,
+                self.default_series_len,
+                self.default_time_interval,
+                self.default_mutable_chunk_num,
+            )
+        });
+        return table.insert(timestamp, labels, scalars).map_err(|err| {
+            DBWriteError::DBInternalError {
+                desc: format!("{:?}", err),
+            }
+        });
     }
 
     fn create_table(
@@ -361,36 +347,126 @@ impl DB {
         series_len: u32,
         time_interval: Duration,
         mutable_chunk_num: usize,
-    ) -> (Arc<RwLock<Table>>, Arc<mpsc::Sender<InsertRequest>>) {
-        let table = Arc::new(RwLock::new(Table::new(
-            table_name,
-            series_len,
-            time_interval,
-            mutable_chunk_num,
-        )));
-        let (tx, mut rx) = mpsc::channel::<InsertRequest>(1);
-        let table_worker = Arc::clone(&table);
-        self.write_worker.spawn(async move {
-            while let Some(request) = rx.recv().await {
-                request
-                    .ret
-                    .send(table_worker.write().unwrap().insert(
-                        request.timestamp,
-                        request.labels,
-                        request.scalars,
-                    ))
-                    .unwrap_or_else(|err| panic!("{:?}", err));
-            }
-        });
-        return (table, Arc::new(tx));
+    ) -> Table {
+        return Table::new(table_name, series_len, time_interval, mutable_chunk_num);
     }
 }
 
+#[derive(Debug)]
 struct InsertRequest {
+    table_name: Arc<str>,
     timestamp: SystemTime,
     labels: HashMap<String, String>,
     scalars: HashMap<String, Scalar>,
     ret: oneshot::Sender<Result<(), DBWriteError>>,
+}
+
+#[derive(Debug)]
+pub struct ShardedDB {
+    labels: Arc<RwLock<Vec<String>>>,
+    senders: Vec<Sender<InsertRequest>>,
+    // dones: Vec<Receiver<Result<(), thread::Error>>>,
+}
+
+impl ShardedDB {
+    pub async fn new(
+        workers: &CoreBoundWorkers,
+        default_series_len: u32,
+        default_time_interval: Duration,
+        default_mutable_chunk_num: usize,
+    ) -> Self {
+        let mut senders = Vec::new();
+        // let mut dones = Vec::new();
+        for worker in workers.iter() {
+            let (insert_req, mut insert_recv) = mpsc::channel::<InsertRequest>(1);
+            let res = worker
+                .spawn(move || {
+                    Box::pin(async move {
+                        let db = DB::new(
+                            default_series_len,
+                            default_time_interval,
+                            default_mutable_chunk_num,
+                        );
+                        while let Some(req) = insert_recv.recv().await {
+                            let ret =
+                                db.insert(req.table_name, req.timestamp, req.labels, req.scalars);
+                            req.ret.send(ret).unwrap();
+                        }
+                    })
+                })
+                .await;
+            if res.is_err() {
+                panic!("test");
+            }
+            // dones.push(done);
+            senders.push(insert_req);
+        }
+        return Self {
+            senders,
+            // dones,
+            labels: Arc::new(RwLock::new(Vec::new())),
+        };
+    }
+
+    pub async fn insert(
+        &self,
+        table_name: Arc<str>,
+        timestamp: SystemTime,
+        labels: HashMap<String, String>,
+        scalars: HashMap<String, Scalar>,
+    ) -> Result<(), DBWriteError> {
+        let mut labels_clone = labels.clone();
+        let mut label_values = {
+            let schema = self.labels.read().unwrap();
+            let mut label_values = Vec::with_capacity(schema.len());
+            for label_key in schema.iter() {
+                match labels_clone.remove_entry(label_key) {
+                    Some((_, value)) => label_values.push(value),
+                    None => label_values.push(String::from("value")),
+                }
+            }
+            label_values
+        };
+        if !labels_clone.is_empty() {
+            let mut labels_clone = labels.clone();
+            let mut schema = self.labels.write().unwrap();
+            label_values = Vec::with_capacity(schema.len());
+            for label_key in schema.iter() {
+                match labels_clone.remove_entry(label_key) {
+                    Some((_, value)) => label_values.push(value),
+                    None => label_values.push(String::from("value")),
+                }
+            }
+            if !labels_clone.is_empty() {
+                for (key, value) in labels_clone.drain() {
+                    schema.push(key);
+                    label_values.push(value);
+                }
+            }
+        }
+        let hash = seahash::hash(
+            label_values
+                .iter()
+                .flat_map(|s| s.chars())
+                .collect::<String>()
+                .as_ref(),
+        );
+        let shard = hash as usize % self.senders.len();
+        let (ret, ret_recv) = oneshot::channel();
+        self.senders
+            .get(shard)
+            .unwrap()
+            .send(InsertRequest {
+                table_name,
+                timestamp,
+                labels,
+                scalars,
+                ret,
+            })
+            .await
+            .unwrap();
+        return ret_recv.await.unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -426,8 +502,8 @@ mod tests {
         println!("{:?}", table.mutable_chunks);
 
         let mut ctx = ExecutionContext::new();
-        ctx.register_table(Arc::clone(&table.name).as_ref(), Arc::new(table))
-            .unwrap();
+        // ctx.register_table(Arc::clone(&table.name).as_ref(), Arc::new(table))
+        //     .unwrap();
         ctx.register_udf(make_range_udf());
         ctx.register_udf(make_time_udf());
         let sql_results = ctx

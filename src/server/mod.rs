@@ -5,28 +5,25 @@ use crate::server::proto::{
     InsertRequest, InsertResponse, Response as ServiceResponse, Status as ServiceStatus,
 };
 use crate::storage::chunk::Scalar;
-use crate::storage::db::DB;
+use crate::storage::db::{ShardedDB, DB};
+use crate::storage::util::thread::CoreBoundWorkers;
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use proto::service_server::Service;
+use std::sync::Arc;
 use std::time::Duration;
 use tonic::{Request, Response, Status};
 
 #[derive(Debug)]
 pub struct Server {
-    db: DB,
+    db: ShardedDB,
 }
 
 impl Server {
-    pub fn new(query_worker_num: usize, write_worker_num: usize) -> Self {
+    pub async fn new(worker_num: usize) -> Self {
+        let workers = CoreBoundWorkers::new(worker_num).unwrap();
         return Self {
-            db: DB::new(
-                query_worker_num,
-                write_worker_num,
-                1440,
-                5 * Duration::SECOND,
-                24,
-            ),
+            db: ShardedDB::new(&workers, 1440, 5 * Duration::SECOND, 24).await,
         };
     }
 }
@@ -60,7 +57,12 @@ impl Service for Server {
             let timestamp = Utc.timestamp_nanos(request.timestamp).into();
             let result = match self
                 .db
-                .insert(&request.table_name, timestamp, labels, scalars)
+                .insert(
+                    Arc::from(request.table_name.as_ref()),
+                    timestamp,
+                    labels,
+                    scalars,
+                )
                 .await
             {
                 Ok(_) => ServiceResponse {

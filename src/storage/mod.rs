@@ -1,5 +1,5 @@
-pub(crate) mod chunk;
-pub(crate) mod db;
+pub mod chunk;
+pub mod db;
 mod error;
 mod query;
-mod util;
+pub mod util;
